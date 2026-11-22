@@ -2,7 +2,7 @@ import { auth, db } from './firebase.js';
 import { getCurrentUser } from './navigation.js';
 import {
   collection, addDoc, getDocs, doc, updateDoc,
-  query, orderBy, serverTimestamp
+  query, orderBy, serverTimestamp, getDoc
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 
 
@@ -61,6 +61,7 @@ let currentLatitude = null;
 let currentLongitude = null;
 let currentMapsLink = null;
 let allContacts = [];
+let userProfile = null;
 let voiceRecognition = null;
 let isVoiceActive = false;
 let fallbackInterval = null;
@@ -91,10 +92,23 @@ try {
 // ═══════════════════════════════════════
 window.addEventListener('authReady', async (e) => {
   const user = e.detail.user;
+  await loadUserProfile(user);
   await loadDashboardData(user);
   await fetchCurrentLocation();
   await loadAllContacts(user);
 });
+
+async function loadUserProfile(user) {
+  if (!user) return;
+  try {
+    const userSnap = await getDoc(doc(db, 'users', user.uid));
+    if (userSnap.exists()) {
+      userProfile = userSnap.data();
+    }
+  } catch (e) {
+    console.warn('Could not load user profile details:', e);
+  }
+}
 
 // ═══════════════════════════════════════════════════════
 // GPS LOCATION - WITH FALLBACK FOR LAPTOP
@@ -348,7 +362,7 @@ function initVoiceTrigger() {
   const TRIGGER_WORDS = [
     'help', 'help me', 'emergency', 'sos',
     'save me', 'danger', 'bachao', 'madad',
-    'please help', 'i need help'
+    'please help', 'i need help', 'police'
   ];
 
   voiceRecognition.onresult = (event) => {
@@ -356,26 +370,28 @@ function initVoiceTrigger() {
     voiceRestartCount = 0;
 
     for (let i = event.resultIndex; i < event.results.length; i++) {
-      const transcript = event.results[i][0].transcript.toLowerCase().trim();
+      for (let alt = 0; alt < event.results[i].length; alt++) {
+        const transcript = event.results[i][alt].transcript.toLowerCase().trim();
 
-      // Only log final results to reduce noise
-      if (event.results[i].isFinal) {
-        console.log('🎤 Heard (final):', transcript);
-      }
+        // Only log final results to reduce noise
+        if (event.results[i].isFinal && alt === 0) {
+          console.log('🎤 Heard (final):', transcript);
+        }
 
-      const triggered = TRIGGER_WORDS.some(word => transcript.includes(word));
+        const triggered = TRIGGER_WORDS.some(word => transcript.includes(word));
 
-      if (triggered && !isAlarmActive) {
-        console.log('🚨 VOICE TRIGGER DETECTED!');
-        showToast('🎤 Voice detected: "' + transcript + '" - Triggering SOS!', 'info');
+        if (triggered && !isAlarmActive) {
+          console.log('🚨 VOICE TRIGGER DETECTED! Transcript:', transcript);
+          showToast('🎤 Voice detected: "' + transcript + '" - Triggering SOS!', 'info');
 
-        // Stop listening temporarily
-        try { voiceRecognition.stop(); } catch (e) { /* ignore */ }
+          // Cleanly stop listening so mic doesn't restart during the emergency alarm
+          stopVoiceTrigger();
 
-        setTimeout(() => {
-          triggerSOSDirectly();
-        }, 500);
-        return;
+          setTimeout(() => {
+            triggerSOSDirectly();
+          }, 500);
+          return;
+        }
       }
     }
   };
@@ -607,35 +623,66 @@ function playFallbackAlarm() {
 async function sendEmailAlerts(user, mapsLink, latitude, longitude) {
   if (typeof emailjs === 'undefined') {
     console.warn('EmailJS not available');
-    return 0;
+    return { total: 0, sent: 0, failed: 0, error: 'EmailJS SDK not loaded' };
+  }
+
+  // Ensure contacts are loaded
+  if (!allContacts || allContacts.length === 0) {
+    await loadAllContacts(user);
+  }
+
+  // Ensure user profile is loaded for name/phone
+  if (!userProfile) {
+    await loadUserProfile(user);
   }
 
   const emailContacts = allContacts.filter(c => c.email);
-  if (emailContacts.length === 0) return 0;
+  if (emailContacts.length === 0) {
+    return { total: 0, sent: 0, failed: 0, error: 'No contacts with email' };
+  }
 
   const timestamp = new Date().toLocaleString('en-IN', { timeZone: 'Asia/Kolkata' });
+  const userName = userProfile?.name || user.displayName || 'SOS User';
+  const userPhone = userProfile?.phone || '';
   const promises = [];
 
   emailContacts.forEach((contact) => {
     const params = {
       to_email: contact.email,
       contact_name: contact.name,
-      user_name: user.displayName || 'SOS User',
+      user_name: userName,
       user_email: user.email,
-      maps_link: mapsLink,
+      user_phone: userPhone,
+      alert_time: timestamp,
       timestamp: timestamp,
-      message: `🚨 EMERGENCY! ${user.displayName || 'SOS User'} needs help!\n📍 Location: Lat ${latitude.toFixed(6)}, Lng ${longitude.toFixed(6)}\n🗺️ Google Maps: ${mapsLink}\nPlease respond immediately!`
+      maps_link: mapsLink,
+      latitude: latitude,
+      longitude: longitude,
+      message: `🚨 EMERGENCY! ${userName} needs help!\n📍 Location: Lat ${latitude.toFixed(6)}, Lng ${longitude.toFixed(6)}\n🗺️ Google Maps: ${mapsLink}\nPlease respond immediately!`
     };
 
     const p = emailjs.send(EMAILJS_SERVICE_ID, EMAILJS_TEMPLATE_ID, params)
-      .then(() => console.log('✅ Email sent to', contact.name))
-      .catch((err) => console.error('❌ Email failed to', contact.name, err));
+      .then((res) => {
+        console.log('✅ Email sent successfully to', contact.name, res);
+        return { success: true, contact: contact.name };
+      })
+      .catch((err) => {
+        console.error('❌ Email failed to', contact.name, err);
+        return { success: false, contact: contact.name, error: err };
+      });
 
     promises.push(p);
   });
 
-  await Promise.all(promises);
-  return emailContacts.length;
+  const results = await Promise.all(promises);
+  const sentCount = results.filter(r => r.success).length;
+
+  return {
+    total: emailContacts.length,
+    sent: sentCount,
+    failed: emailContacts.length - sentCount,
+    results
+  };
 }
 
 // ═══════════════════════════════════════════════════════
@@ -758,16 +805,19 @@ async function triggerSOSDirectly() {
     // ═══ STEP 3: EMAIL ═══
     updateProgress(progressEmail, 'loading', 'Sending emails...');
     try {
-      const emailCount = await sendEmailAlerts(user, mapsLink, latitude, longitude);
-      if (emailCount > 0) {
-        updateProgress(progressEmail, 'done', `✅ ${emailCount} email(s) sent`);
+      const emailResult = await sendEmailAlerts(user, mapsLink, latitude, longitude);
+      if (emailResult.sent > 0) {
+        updateProgress(progressEmail, 'done', `✅ ${emailResult.sent}/${emailResult.total} email(s) sent`);
         // Update Firestore (don't await - non-blocking)
         updateDoc(doc(db, 'users', user.uid, 'sos_history', currentAlertDocId), { emailSent: true }).catch(e => console.warn('Email status update failed:', e));
-      } else {
+      } else if (emailResult.total === 0) {
         updateProgress(progressEmail, 'error', '⚠️ No contacts with email');
+      } else {
+        updateProgress(progressEmail, 'error', '❌ Email failed to send');
       }
     } catch (emailErr) {
-      updateProgress(progressEmail, 'error', '⚠️ Email failed');
+      console.error('Email error:', emailErr);
+      updateProgress(progressEmail, 'error', '❌ Email failed');
     }
 
     // ═══ STEP 4: WHATSAPP ═══
